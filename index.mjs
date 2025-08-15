@@ -49,7 +49,7 @@ if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 const app = express();
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 /** Build a pg Client pinned to the IPv4 A-record of the pooler host */
 async function pgClientFromUrl(pgUrlString) {
@@ -469,6 +469,64 @@ app.post("/docs/ingest", auth, upload.single("file"), async (req, res) => {
     let text = body.content || "";
     let originalName = body.file_name || null;
     let uploadedPath = null;
+// POST /docs/ingest-base64  (JSON only)
+// Body: { filename, file_base64, title?, author?, published_at?, tags?, source_uri? }
+app.post("/docs/ingest-base64", auth, async (req, res) => {
+  try {
+    const { filename, file_base64, title, author = null, published_at = null, tags = [], source_uri = null } = req.body || {};
+    if (!filename || !file_base64) {
+      return res.status(400).json({ error: "Missing filename or file_base64" });
+    }
+
+    // Decode base64 to Buffer
+    // Accept both raw base64 and data URLs (e.g., "data:application/pdf;base64,....")
+    const base64 = String(file_base64).includes(",")
+      ? String(file_base64).split(",").pop()
+      : String(file_base64);
+    const buf = Buffer.from(base64, "base64");
+
+    // Store original in Supabase (optional but keeps provenance)
+    const path = `${Date.now()}_${filename}`;
+    const { data: up, error: upErr } = await supabase
+      .storage.from(process.env.SUPABASE_BUCKET)
+      .upload(path, buf, { cacheControl: "3600", upsert: true });
+    if (upErr) throw upErr;
+    const uploadedPath = up.path;
+
+    // Extract text for chunking/embedding
+    const text = await extractTextFromBuffer(filename, buf);
+    if (!text || !text.trim()) return res.status(400).json({ error: "No extractable text in file" });
+
+    // Normalise tags
+    const normTags = Array.isArray(tags)
+      ? tags
+      : (typeof tags === "string"
+          ? tags.split(",").map(s => s.trim()).filter(Boolean)
+          : []);
+
+    const finalTitle = title || filename;
+    const doc_id = await upsertDocument({
+      title: finalTitle,
+      author,
+      published_at,
+      tags: normTags,
+      metadata: { uploadedPath, via: "base64" },
+      source_uri
+    });
+
+    const pieces = chunkText(text);
+    let order = 0;
+    for (const p of pieces) {
+      const vecLit = await embed(p); // "[...]" literal
+      await insertChunk(doc_id, order++, p, vecLit);
+    }
+
+    res.json({ ok: true, doc_id, title: finalTitle, tags: normTags, chunks: pieces.length });
+  } catch (e) {
+    console.error("docs/ingest-base64 error:", e);
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
 
     // If a file is uploaded, save it (optional) and extract text
     if (req.file) {

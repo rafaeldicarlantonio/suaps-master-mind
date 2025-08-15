@@ -79,15 +79,17 @@ function auth(req, res, next) {
   next();
 }
 
-// ---- Embeddings helper ----
+// ---- Embedding Helper (returns pgvector text literal) ----
 async function embed(text) {
   const resp = await openai.embeddings.create({ model: EMBEDDINGS_MODEL, input: text });
   const vec = resp.data[0].embedding;
   if (vec.length !== EMBEDDING_DIM) {
     throw new Error(`Embedding dim mismatch: got ${vec.length}, expected ${EMBEDDING_DIM}`);
   }
-  return vec;
+  // Return as pgvector string literal: "[0.1,0.2,...]"
+  return `[${vec.join(",")}]`;
 }
+
 
 /* ========= ROUTES ========= */
 

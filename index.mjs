@@ -1,3 +1,4 @@
+console.log("Booting Startup Brain API...");
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";

@@ -1,0 +1,239 @@
+openapi: 3.1.0
+info:
+  title: Startup Brain Memory API (Vector)
+  version: "1.1"
+servers:
+  - url: https://YOUR-SERVER-URL
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    MemoryItem:
+      type: object
+      required: [user_id, key, value]
+      properties:
+        user_id: { type: string }
+        key: { type: string }
+        value: { type: string }
+        type: { type: string, enum: [preference, fact, project, glossary, profile, context] }
+        scope: { type: string, enum: [global, thread, session], default: global }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+        source: { type: string, default: user }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        pii: { type: boolean, default: false }
+        sensitivity: { type: string, enum: [low, medium, high], default: low }
+        version: { type: string, default: "1.0" }
+        created_at: { type: string }
+        updated_at: { type: string }
+        expires_at: { type: string, nullable: true }
+        meta:
+          type: object
+          additionalProperties: true
+paths:
+  /remember:
+    post:
+      operationId: remember
+      summary: Upsert a memory item (writes vector)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryItem'
+      responses:
+        "200":
+          description: Upserted
+  /remember:batch:
+    post:
+      operationId: rememberBatch
+      summary: Upsert multiple memory items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/MemoryItem' }
+      responses:
+        "200":
+          description: Upserted
+  /recall:
+    get:
+      operationId: recall
+      summary: Hybrid retrieval (filters + keyword + vector)
+      parameters:
+        - in: query
+          name: user_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: query
+          schema: { type: string }
+        - in: query
+          name: type
+          schema: { type: string }
+        - in: query
+          name: category
+          schema: { type: string }
+        - in: query
+          name: tags
+          schema: { type: string, description: Comma-separated list }
+        - in: query
+          name: key
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 10, minimum: 1, maximum: 50 }
+      responses:
+        "200":
+          description: OK
+  /list:
+    get:
+      operationId: list
+      summary: List memories by filters
+      parameters:
+        - in: query
+          name: user_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: type
+          schema: { type: string }
+        - in: query
+          name: category
+          schema: { type: string }
+        - in: query
+          name: tags
+          schema: { type: string, description: Comma-separated list }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+  /forget:
+    delete:
+      operationId: forget
+      summary: Delete by key or filters; key="__ALL__" clears all
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: { type: string }
+                key: { type: string }
+                type: { type: string }
+                category: { type: string }
+                tags: { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: Deleted
+  /export:
+    get:
+      operationId: export
+      summary: Export all memories for a user
+      parameters:
+        - in: query
+          name: user_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+
+          paths:
+  /docs/ingest:
+    post:
+      operationId: ingestDocument
+      summary: Ingest a document (multipart or JSON)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title: { type: string }
+                author: { type: string }
+                published_at: { type: string }
+                tags: { type: string, description: "JSON array, e.g. [\"ai\",\"ops\"]" }
+                source_uri: { type: string }
+          application/json:
+            schema:
+              type: object
+              required: [title, content]
+              properties:
+                title: { type: string }
+                content: { type: string }
+                author: { type: string }
+                published_at: { type: string }
+                tags: { type: array, items: { type: string } }
+                source_uri: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /docs/search:
+    get:
+      operationId: searchDocs
+      summary: Search across document chunks (hybrid vector + keyword)
+      parameters:
+        - in: query
+          name: query
+          required: true
+          schema: { type: string }
+        - in: query
+          name: top_k
+          schema: { type: integer, default: 8 }
+        - in: query
+          name: from
+          schema: { type: string }
+        - in: query
+          name: to
+          schema: { type: string }
+        - in: query
+          name: tags
+          schema: { type: string, description: Comma-separated tags }
+        - in: query
+          name: doc_id
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /docs/get:
+    get:
+      operationId: getDoc
+      summary: Get a document metadata and signed URL if stored
+      parameters:
+        - in: query
+          name: doc_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /docs/delete:
+    delete:
+      operationId: deleteDoc
+      summary: Delete a document and its chunks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [doc_id]
+              properties:
+                doc_id: { type: string }
+      responses:
+        "200": { description: OK }

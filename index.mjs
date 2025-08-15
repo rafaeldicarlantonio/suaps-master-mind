@@ -100,7 +100,7 @@ app.post("/remember", auth, async (req, res) => {
         user_id, key, value, type, scope, category, tags, source, confidence,
         pii, sensitivity, version, created_at, updated_at, expires_at, meta, embedding
       ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW(),$13,$14,$15
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW(),$13,$14,$15::vector
       )
       ON CONFLICT (user_id, key)
       DO UPDATE SET
@@ -190,7 +190,7 @@ app.get("/recall", auth, async (req, res) => {
       const qvec = await embed(String(query));
       const vsql = `SELECT user_id, key, value, type, scope, category, tags, source, confidence, pii, sensitivity, version, created_at, updated_at, expires_at, meta
                     FROM memories WHERE ${conds.join(" AND ")}
-                    ORDER BY embedding <=> $${params.length + 1} LIMIT $${params.length + 2}`;
+                    ORDER BY embedding <=> $${params.length + 1}::vector LIMIT $${params.length + 2}`;
       const vres = await db.query(vsql, [...params, qvec, lim]);
       vectorResults = vres.rows;
     }

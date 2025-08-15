@@ -1,0 +1,43 @@
+name: Ingest documents into Supabase
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Folder with files (in repo)"
+        required: true
+        default: "docs"
+      tags:
+        description: "Comma-separated tags to attach to every doc"
+        required: false
+        default: ""
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    env:
+      # secrets
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+      SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+      # optional knobs
+      EMBEDDINGS_MODEL: ${{ secrets.EMBEDDINGS_MODEL }}
+      EMBEDDING_DIM: ${{ secrets.EMBEDDING_DIM }}
+      MAX_CHUNK_TOKENS: 800
+      CHUNK_OVERLAP_TOKENS: 100
+      # inputs
+      INPUT_FOLDER: ${{ github.event.inputs.folder }}
+      INPUT_TAGS: ${{ github.event.inputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci || npm i
+
+      - name: Run ingestion
+        run: node scripts/ingest.mjs

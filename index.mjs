@@ -1,4 +1,4 @@
-// index.mjs — Supabase Pooler + IPv4 + SSL + hardened inputs
+// index.mjs — Supabase Pooler + IPv4 + SSL + vector memory + docs module
 console.log("Booting Startup Brain API...");
 
 import express from "express";
@@ -9,6 +9,13 @@ import pkg from "pg";
 import OpenAI from "openai";
 import dns from "dns";
 import { URL } from "url";
+
+// ---- Documents module deps (loaded early where needed)
+import multer from "multer";
+import mammoth from "mammoth";
+import { parse as parseHTML } from "node-html-parser";
+import { encoding_for_model } from "tiktoken";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 
 dotenv.config();
 const { Client } = pkg;
@@ -21,12 +28,19 @@ if (typeof dns.setDefaultResultOrder === "function") {
 // ---- Env ----
 const PORT = process.env.PORT || 8787;
 const API_TOKEN = process.env.API_TOKEN || "";
-const DATABASE_URL = process.env.DATABASE_URL; // use *pooler* URI here
+const DATABASE_URL = process.env.DATABASE_URL;     // use *pooler* URI here
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Embeddings defaults (free tier)
 const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL || "text-embedding-3-small";
 const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM || "1536", 10);
+
+// Docs module env (Storage + chunking)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "docs";
+const MAX_CHUNK_TOKENS = parseInt(process.env.MAX_CHUNK_TOKENS || "800", 10);
+const CHUNK_OVERLAP_TOKENS = parseInt(process.env.CHUNK_OVERLAP_TOKENS || "100", 10);
 
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -90,8 +104,7 @@ async function embed(text) {
   return `[${vec.join(",")}]`;
 }
 
-
-/* ========= ROUTES ========= */
+/* ========= MEMORY ROUTES ========= */
 
 // Root & health
 app.get("/", (req, res) => res.type("text").send("Startup Brain API is running. Try /health"));
@@ -113,7 +126,6 @@ app.post("/remember", auth, async (req, res) => {
 
     // Normalize inputs
     if (typeof tags === "string") {
-      // accept "formatting" or "a,b,c"
       tags = tags.includes(",")
         ? tags.split(",").map(s => s.trim()).filter(Boolean)
         : [tags.trim()].filter(Boolean);
@@ -322,22 +334,20 @@ app.get("/export", auth, async (req, res) => {
   }
 });
 
-// ---- Start ----
-app.listen(PORT, () => console.log(`Memory API (vector) running on port ${PORT}`));
-// ===== Documents module (ingest + search + get + delete) =====
-import multer from "multer";
-import mammoth from "mammoth";
-import { parse as parseHTML } from "node-html-parser";
-import { encoding_for_model } from "tiktoken";
-import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+/* ========= DOCUMENTS MODULE ========= */
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB
-const supabase = createSupabaseClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
+// Multer (15MB)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+// Supabase Storage (server-side only)
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE)
+  ? createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+  : null;
 
 function enc() { return encoding_for_model("gpt-4o-mini"); } // ok for token counting
 function countTokens(text) { const e = enc(); const n = e.encode(text || "").length; e.free(); return n; }
 
-function chunkText(text, maxTokens = parseInt(process.env.MAX_CHUNK_TOKENS || "800",10), overlap = parseInt(process.env.CHUNK_OVERLAP_TOKENS || "100",10)) {
+function chunkText(text, maxTokens = MAX_CHUNK_TOKENS, overlap = CHUNK_OVERLAP_TOKENS) {
   const e = enc(); const toks = e.encode(text || ""); const chunks = [];
   for (let i = 0; i < toks.length; i += Math.max(1, maxTokens - overlap)) {
     const slice = toks.slice(i, Math.min(i + maxTokens, toks.length));
@@ -346,16 +356,15 @@ function chunkText(text, maxTokens = parseInt(process.env.MAX_CHUNK_TOKENS || "8
   }
   e.free(); return chunks.length ? chunks : [text || ""];
 }
-// Lazy-load pdf-parse with a stable path to avoid loading the package's test harness
+
+// Lazy-load pdf-parse with a stable path to avoid loading its test harness
 let _pdfParseFn = null;
 async function getPdfParse() {
   if (_pdfParseFn) return _pdfParseFn;
   try {
-    // prefer the library entry (works in ESM)
     const mod = await import("pdf-parse/lib/pdf-parse.js");
     _pdfParseFn = mod.default || mod;
   } catch (e) {
-    // fallback to package root if needed
     const mod = await import("pdf-parse");
     _pdfParseFn = mod.default || mod;
   }
@@ -388,8 +397,7 @@ async function extractTextFromBuffer(filename, buffer) {
   throw new Error("Unsupported file type (pdf, docx, html, txt, md)");
 }
 
-
-// Create doc row
+// DB helpers for docs
 async function upsertDocument({ title, author = null, published_at = null, tags = [], metadata = {}, source_uri = null }) {
   const q = await db.query(
     `INSERT INTO documents (title, author, published_at, tags, metadata, source_uri)
@@ -399,7 +407,6 @@ async function upsertDocument({ title, author = null, published_at = null, tags 
   return q.rows[0].id;
 }
 
-// Insert chunk row
 async function insertChunk(doc_id, order_index, content, embeddingLiteral) {
   const token_count = countTokens(content);
   await db.query(
@@ -409,54 +416,115 @@ async function insertChunk(doc_id, order_index, content, embeddingLiteral) {
   );
 }
 
+/** Auto-generate title + tags when missing/empty using OpenAI */
+async function autoTitleAndTags(text, givenTitle, givenTagsArr) {
+  let finalTitle = givenTitle && givenTitle.trim() ? givenTitle.trim() : null;
+  let finalTags = Array.isArray(givenTagsArr) ? givenTagsArr.filter(Boolean) : [];
+
+  if (finalTitle && finalTags.length) return { title: finalTitle, tags: finalTags };
+
+  const prompt = `
+You extract metadata for a knowledge base.
+Given the text, produce a *concise* JSON object with:
+- "title": <= 12 words, descriptive and specific.
+- "tags": exactly 5 short tags (single words or short phrases).
+
+Return ONLY valid JSON like:
+{"title":"...", "tags":["t1","t2","t3","t4","t5"]}
+
+TEXT START
+${text.slice(0, 2500)}
+TEXT END
+`.trim();
+
+  try {
+    const metaResp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2
+    });
+    const raw = metaResp.choices?.[0]?.message?.content?.trim() || "{}";
+    const jsonStart = raw.indexOf("{");
+    const jsonEnd = raw.lastIndexOf("}");
+    const safe = jsonStart >= 0 && jsonEnd > jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : "{}";
+    const parsed = JSON.parse(safe);
+    if (!finalTitle && typeof parsed.title === "string") finalTitle = parsed.title.slice(0, 120);
+    if (finalTags.length === 0 && Array.isArray(parsed.tags)) finalTags = parsed.tags.slice(0, 5).map(s => String(s).trim()).filter(Boolean);
+  } catch (err) {
+    console.warn("autoTitleAndTags failed, falling back:", err.message || err);
+  }
+
+  // Final safety defaults
+  if (!finalTitle) finalTitle = "Untitled document";
+  if (finalTags.length === 0) finalTags = ["document", "ingest", "untagged", "text", "kb"];
+  return { title: finalTitle, tags: finalTags };
+}
+
 // POST /docs/ingest  (multipart OR JSON)
+// - Multipart: fields: file, title?, tags? (JSON array or CSV), author?, published_at?, source_uri?
+// - JSON: { title?, content, tags?[], author?, published_at?, source_uri? }
 app.post("/docs/ingest", auth, upload.single("file"), async (req, res) => {
   try {
     const body = req.body || {};
-    const title = body.title || (req.file ? req.file.originalname : null);
-    if (!title) return res.status(400).json({ error: "Missing title" });
-
     let text = body.content || "";
+    let originalName = body.file_name || null;
     let uploadedPath = null;
 
-    // If a file was uploaded, store it in Supabase Storage and extract text
+    // If a file is uploaded, save it (optional) and extract text
     if (req.file) {
-      const path = `${Date.now()}_${req.file.originalname}`;
+      originalName = req.file.originalname;
+      if (!supabase) {
+        return res.status(500).json({ error: "Supabase Storage not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE)" });
+      }
+      const path = `${Date.now()}_${originalName}`;
       const { data, error } = await supabase
-        .storage.from(process.env.SUPABASE_BUCKET)
+        .storage.from(SUPABASE_BUCKET)
         .upload(path, req.file.buffer, { cacheControl: "3600", contentType: req.file.mimetype, upsert: true });
       if (error) throw error;
       uploadedPath = data.path;
-      text = await extractTextFromBuffer(req.file.originalname, req.file.buffer);
+      text = await extractTextFromBuffer(originalName, req.file.buffer);
     }
 
-    if (!text || !text.trim()) return res.status(400).json({ error: "No content found" });
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "No content found (upload a file or provide 'content' in JSON)." });
+    }
 
-    // Parse tags if they came as JSON string in multipart
-    let tags = [];
+    // Process provided tags (can be JSON string or CSV)
+    let providedTags = [];
     if (typeof body.tags === "string") {
-      try { const arr = JSON.parse(body.tags); if (Array.isArray(arr)) tags = arr; } catch {}
+      try {
+        const arr = JSON.parse(body.tags);
+        if (Array.isArray(arr)) providedTags = arr;
+        else providedTags = body.tags.split(",").map(s => s.trim()).filter(Boolean);
+      } catch {
+        providedTags = body.tags.split(",").map(s => s.trim()).filter(Boolean);
+      }
     } else if (Array.isArray(body.tags)) {
-      tags = body.tags;
+      providedTags = body.tags.filter(Boolean);
     }
 
+    // Auto title & tags if missing/empty
+    const { title, tags } = await autoTitleAndTags(text, body.title || originalName, providedTags);
+
+    // Insert document row
     const doc_id = await upsertDocument({
       title,
       author: body.author || null,
       published_at: body.published_at || null,
       tags,
-      metadata: { uploadedPath },
+      metadata: { uploadedPath, originalName },
       source_uri: body.source_uri || null
     });
 
+    // Chunk, embed & insert
     const pieces = chunkText(text);
     let order = 0;
     for (const p of pieces) {
-      const vecLit = await embed(p);               // returns "[...]" string
+      const vecLit = await embed(p);   // returns "[...]" string for pgvector
       await insertChunk(doc_id, order++, p, vecLit);
     }
 
-    res.json({ ok: true, doc_id, chunks: pieces.length });
+    res.json({ ok: true, doc_id, title, tags, chunks: pieces.length });
   } catch (e) {
     console.error("docs/ingest error:", e);
     res.status(500).json({ error: e.message || String(e) });
@@ -489,7 +557,7 @@ app.get("/docs/search", auth, async (req, res) => {
     `;
     const v = await db.query(sql, [...params, qvec, limit]);
 
-    // Hybrid: simple keyword fall-back and merge
+    // Hybrid: simple keyword fallback + merge
     const ksql = `
       SELECT c.doc_id, c.order_index, c.content, d.title, d.source_uri, d.tags, d.metadata
       FROM doc_chunks c
@@ -522,9 +590,9 @@ app.get("/docs/get", auth, async (req, res) => {
 
     let signedUrl = null;
     const uploadedPath = d.rows[0].metadata?.uploadedPath;
-    if (uploadedPath) {
+    if (uploadedPath && supabase) {
       const { data, error } = await supabase
-        .storage.from(process.env.SUPABASE_BUCKET)
+        .storage.from(SUPABASE_BUCKET)
         .createSignedUrl(uploadedPath, 3600);
       if (!error) signedUrl = data.signedUrl;
     }
@@ -548,3 +616,6 @@ app.delete("/docs/delete", auth, async (req, res) => {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
+
+// ---- Start ----
+app.listen(PORT, () => console.log(`Memory API (vector) running on port ${PORT}`));

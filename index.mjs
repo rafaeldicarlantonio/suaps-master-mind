@@ -1,21 +1,30 @@
 console.log("Booting Startup Brain API...");
+
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
 import pkg from "pg"; // { Client }
 import OpenAI from "openai";
+import dns from "dns";
 
 dotenv.config();
 const { Client } = pkg;
+
+/** Force IPv4 globally (prevents ENETUNREACH to IPv6 hosts) */
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 // ---- Env ----
 const PORT = process.env.PORT || 8787;
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL || "text-embedding-3-large"; // 3072 dims
-const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM || "3072", 10);
+
+// Default to small model (free/cheap) unless you override via env
+const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL || "text-embedding-3-small";
+const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM || "1536", 10);
 
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -26,18 +35,12 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-import dns from "dns";
-
-// Force IPv4 + SSL (required by Supabase)
+/** Postgres client — require SSL for Supabase */
 const db = new Client({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Supabase needs SSL in serverless envs
-  // Force IPv4 so we don't hit IPv6 ENETUNREACH on some hosts
-  lookup: (hostname, options, cb) =>
-    dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
+  ssl: { rejectUnauthorized: false }
 });
 await db.connect();
-
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -56,8 +59,6 @@ async function embed(text) {
   }
   return vec;
 }
-
-function toPgArray(arr) { return `{${(arr || []).map(s => (s || "").replace(/"/g, '\\"')).join(',')}}`; }
 
 // ---- Upsert single ----
 app.post("/remember", auth, async (req, res) => {
@@ -251,5 +252,8 @@ app.get("/export", auth, async (req, res) => {
     console.error(e); res.status(500).json({ error: String(e.message || e) });
   }
 });
+
+// ---- Health ----
+app.get("/health", (_, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 app.listen(PORT, () => console.log(`Memory API (vector) on :${PORT}`));

@@ -26,8 +26,18 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const db = new Client({ connectionString: DATABASE_URL });
+import dns from "dns";
+
+// Force IPv4 + SSL (required by Supabase)
+const db = new Client({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Supabase needs SSL in serverless envs
+  // Force IPv4 so we don't hit IPv6 ENETUNREACH on some hosts
+  lookup: (hostname, options, cb) =>
+    dns.lookup(hostname, { family: 4, hints: dns.ADDRCONFIG }, cb),
+});
 await db.connect();
+
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 

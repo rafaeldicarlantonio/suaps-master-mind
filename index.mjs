@@ -150,7 +150,26 @@ app.post("/remember:batch", auth, async (req, res) => {
     console.error(e); res.status(500).json({ error: String(e.message || e) });
   }
 });
-
+// Alias for OpenAPI (":" is invalid in OpenAPI paths)
+app.post("/remember-batch", auth, async (req, res) => {
+  // Accept { items: [MemoryItem, ...] }
+  const body = req.body || {};
+  const items = Array.isArray(body.items) ? body.items : [];
+  let count = 0;
+  for (const it of items) {
+    const r = await fetch(`http://localhost:${PORT}/remember`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {})
+      },
+      body: JSON.stringify(it)
+    });
+    const js = await r.json().catch(() => ({}));
+    if (js && js.ok) count++;
+  }
+  res.json({ ok: true, count });
+});
 // ---- Recall (hybrid) ----
 app.get("/recall", auth, async (req, res) => {
   try {

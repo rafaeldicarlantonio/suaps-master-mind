@@ -326,7 +326,6 @@ app.get("/export", auth, async (req, res) => {
 app.listen(PORT, () => console.log(`Memory API (vector) running on port ${PORT}`));
 // ===== Documents module (ingest + search + get + delete) =====
 import multer from "multer";
-import pdfParse from "pdf-parse";
 import mammoth from "mammoth";
 import { parse as parseHTML } from "node-html-parser";
 import { encoding_for_model } from "tiktoken";
@@ -347,20 +346,48 @@ function chunkText(text, maxTokens = parseInt(process.env.MAX_CHUNK_TOKENS || "8
   }
   e.free(); return chunks.length ? chunks : [text || ""];
 }
+// Lazy-load pdf-parse with a stable path to avoid loading the package's test harness
+let _pdfParseFn = null;
+async function getPdfParse() {
+  if (_pdfParseFn) return _pdfParseFn;
+  try {
+    // prefer the library entry (works in ESM)
+    const mod = await import("pdf-parse/lib/pdf-parse.js");
+    _pdfParseFn = mod.default || mod;
+  } catch (e) {
+    // fallback to package root if needed
+    const mod = await import("pdf-parse");
+    _pdfParseFn = mod.default || mod;
+  }
+  return _pdfParseFn;
+}
 
 async function extractTextFromBuffer(filename, buffer) {
   const lower = (filename || "").toLowerCase();
+
   if (lower.endsWith(".pdf")) {
-    const out = await pdfParse(buffer); return out.text || "";
-  } else if (lower.endsWith(".docx")) {
-    const out = await mammoth.extractRawText({ buffer }); return out.value || "";
-  } else if (lower.endsWith(".html") || lower.endsWith(".htm")) {
-    const root = parseHTML(buffer.toString("utf8")); return root.textContent || "";
-  } else if (lower.endsWith(".txt") || lower.endsWith(".md")) {
+    const pdfParse = await getPdfParse();
+    const out = await pdfParse(buffer);
+    return out.text || "";
+  }
+
+  if (lower.endsWith(".docx")) {
+    const out = await mammoth.extractRawText({ buffer });
+    return out.value || "";
+  }
+
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+    const root = parseHTML(buffer.toString("utf8"));
+    return root.textContent || "";
+  }
+
+  if (lower.endsWith(".txt") || lower.endsWith(".md")) {
     return buffer.toString("utf8");
   }
+
   throw new Error("Unsupported file type (pdf, docx, html, txt, md)");
 }
+
 
 // Create doc row
 async function upsertDocument({ title, author = null, published_at = null, tags = [], metadata = {}, source_uri = null }) {

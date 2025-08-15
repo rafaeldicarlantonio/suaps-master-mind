@@ -324,3 +324,200 @@ app.get("/export", auth, async (req, res) => {
 
 // ---- Start ----
 app.listen(PORT, () => console.log(`Memory API (vector) running on port ${PORT}`));
+// ===== Documents module (ingest + search + get + delete) =====
+import multer from "multer";
+import pdfParse from "pdf-parse";
+import mammoth from "mammoth";
+import { parse as parseHTML } from "node-html-parser";
+import { encoding_for_model } from "tiktoken";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB
+const supabase = createSupabaseClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
+
+function enc() { return encoding_for_model("gpt-4o-mini"); } // ok for token counting
+function countTokens(text) { const e = enc(); const n = e.encode(text || "").length; e.free(); return n; }
+
+function chunkText(text, maxTokens = parseInt(process.env.MAX_CHUNK_TOKENS || "800",10), overlap = parseInt(process.env.CHUNK_OVERLAP_TOKENS || "100",10)) {
+  const e = enc(); const toks = e.encode(text || ""); const chunks = [];
+  for (let i = 0; i < toks.length; i += Math.max(1, maxTokens - overlap)) {
+    const slice = toks.slice(i, Math.min(i + maxTokens, toks.length));
+    chunks.push(e.decode(slice));
+    if (i + maxTokens >= toks.length) break;
+  }
+  e.free(); return chunks.length ? chunks : [text || ""];
+}
+
+async function extractTextFromBuffer(filename, buffer) {
+  const lower = (filename || "").toLowerCase();
+  if (lower.endsWith(".pdf")) {
+    const out = await pdfParse(buffer); return out.text || "";
+  } else if (lower.endsWith(".docx")) {
+    const out = await mammoth.extractRawText({ buffer }); return out.value || "";
+  } else if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+    const root = parseHTML(buffer.toString("utf8")); return root.textContent || "";
+  } else if (lower.endsWith(".txt") || lower.endsWith(".md")) {
+    return buffer.toString("utf8");
+  }
+  throw new Error("Unsupported file type (pdf, docx, html, txt, md)");
+}
+
+// Create doc row
+async function upsertDocument({ title, author = null, published_at = null, tags = [], metadata = {}, source_uri = null }) {
+  const q = await db.query(
+    `INSERT INTO documents (title, author, published_at, tags, metadata, source_uri)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [title, author, published_at, tags, metadata, source_uri]
+  );
+  return q.rows[0].id;
+}
+
+// Insert chunk row
+async function insertChunk(doc_id, order_index, content, embeddingLiteral) {
+  const token_count = countTokens(content);
+  await db.query(
+    `INSERT INTO doc_chunks (doc_id, order_index, content, token_count, embedding)
+     VALUES ($1,$2,$3,$4,$5::vector)`,
+    [doc_id, order_index, content, token_count, embeddingLiteral]
+  );
+}
+
+// POST /docs/ingest  (multipart OR JSON)
+app.post("/docs/ingest", auth, upload.single("file"), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const title = body.title || (req.file ? req.file.originalname : null);
+    if (!title) return res.status(400).json({ error: "Missing title" });
+
+    let text = body.content || "";
+    let uploadedPath = null;
+
+    // If a file was uploaded, store it in Supabase Storage and extract text
+    if (req.file) {
+      const path = `${Date.now()}_${req.file.originalname}`;
+      const { data, error } = await supabase
+        .storage.from(process.env.SUPABASE_BUCKET)
+        .upload(path, req.file.buffer, { cacheControl: "3600", contentType: req.file.mimetype, upsert: true });
+      if (error) throw error;
+      uploadedPath = data.path;
+      text = await extractTextFromBuffer(req.file.originalname, req.file.buffer);
+    }
+
+    if (!text || !text.trim()) return res.status(400).json({ error: "No content found" });
+
+    // Parse tags if they came as JSON string in multipart
+    let tags = [];
+    if (typeof body.tags === "string") {
+      try { const arr = JSON.parse(body.tags); if (Array.isArray(arr)) tags = arr; } catch {}
+    } else if (Array.isArray(body.tags)) {
+      tags = body.tags;
+    }
+
+    const doc_id = await upsertDocument({
+      title,
+      author: body.author || null,
+      published_at: body.published_at || null,
+      tags,
+      metadata: { uploadedPath },
+      source_uri: body.source_uri || null
+    });
+
+    const pieces = chunkText(text);
+    let order = 0;
+    for (const p of pieces) {
+      const vecLit = await embed(p);               // returns "[...]" string
+      await insertChunk(doc_id, order++, p, vecLit);
+    }
+
+    res.json({ ok: true, doc_id, chunks: pieces.length });
+  } catch (e) {
+    console.error("docs/ingest error:", e);
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// GET /docs/search?query=...&top_k=8&tags=a,b&from=YYYY-MM-DD&to=YYYY-MM-DD&doc_id=uuid
+app.get("/docs/search", auth, async (req, res) => {
+  try {
+    const { query = "", top_k = 8, from = null, to = null, tags = "", doc_id = null } = req.query;
+    if (!query) return res.status(400).json({ error: "Missing query" });
+    const limit = Math.max(1, Math.min(20, parseInt(top_k, 10) || 8));
+    const qvec = await embed(String(query));       // "[...]" string
+
+    const conds = ["1=1"]; const params = [];
+    if (from)   { params.push(from);   conds.push(`d.published_at >= $${params.length}`); }
+    if (to)     { params.push(to);     conds.push(`d.published_at <= $${params.length}`); }
+    if (doc_id) { params.push(doc_id); conds.push(`d.id = $${params.length}`); }
+    const tagList = String(tags || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (tagList.length) { params.push(tagList); conds.push(`d.tags && $${params.length}::text[]`); }
+
+    // Vector search + join metadata
+    const sql = `
+      SELECT c.doc_id, c.order_index, c.content, d.title, d.source_uri, d.tags, d.metadata
+      FROM doc_chunks c
+      JOIN documents d ON d.id = c.doc_id
+      WHERE ${conds.join(" AND ")}
+      ORDER BY c.embedding <=> $${params.length + 1}::vector
+      LIMIT $${params.length + 2}
+    `;
+    const v = await db.query(sql, [...params, qvec, limit]);
+
+    // Hybrid: simple keyword fall-back and merge
+    const ksql = `
+      SELECT c.doc_id, c.order_index, c.content, d.title, d.source_uri, d.tags, d.metadata
+      FROM doc_chunks c
+      JOIN documents d ON d.id = c.doc_id
+      WHERE ${conds.join(" AND ")} AND (c.content ILIKE $${params.length + 1})
+      ORDER BY c.created_at DESC
+      LIMIT $${params.length + 2}
+    `;
+    const k = await db.query(ksql, [...params, `%${query}%`, Math.min(10, limit)]);
+
+    const seen = new Set(); const merged = [];
+    for (const r of [...v.rows, ...k.rows]) {
+      const id = `${r.doc_id}:${r.order_index}`;
+      if (!seen.has(id)) { seen.add(id); merged.push(r); }
+    }
+    res.json(merged.slice(0, limit));
+  } catch (e) {
+    console.error("docs/search error:", e);
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// GET /docs/get?doc_id=...
+app.get("/docs/get", auth, async (req, res) => {
+  try {
+    const { doc_id } = req.query || {};
+    if (!doc_id) return res.status(400).json({ error: "Missing doc_id" });
+    const d = await db.query("SELECT * FROM documents WHERE id = $1", [doc_id]);
+    if (!d.rows.length) return res.status(404).json({ error: "Not found" });
+
+    let signedUrl = null;
+    const uploadedPath = d.rows[0].metadata?.uploadedPath;
+    if (uploadedPath) {
+      const { data, error } = await supabase
+        .storage.from(process.env.SUPABASE_BUCKET)
+        .createSignedUrl(uploadedPath, 3600);
+      if (!error) signedUrl = data.signedUrl;
+    }
+
+    res.json({ ...d.rows[0], signedUrl });
+  } catch (e) {
+    console.error("docs/get error:", e);
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// DELETE /docs/delete  { doc_id }
+app.delete("/docs/delete", auth, async (req, res) => {
+  try {
+    const { doc_id } = req.body || {};
+    if (!doc_id) return res.status(400).json({ error: "Missing doc_id" });
+    await db.query("DELETE FROM documents WHERE id = $1", [doc_id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("docs/delete error:", e);
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});

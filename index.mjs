@@ -4,14 +4,15 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
-import pkg from "pg"; // { Client }
+import pkg from "pg";            // { Client }
 import OpenAI from "openai";
 import dns from "dns";
+import { URL } from "url";
 
 dotenv.config();
 const { Client } = pkg;
 
-/** Force IPv4 globally (prevents ENETUNREACH to IPv6 hosts) */
+/** Prefer IPv4 for DNS results */
 if (typeof dns.setDefaultResultOrder === "function") {
   dns.setDefaultResultOrder("ipv4first");
 }
@@ -22,7 +23,7 @@ const API_TOKEN = process.env.API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Default to small model (free/cheap) unless you override via env
+// Default to small model (free/cheap)
 const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL || "text-embedding-3-small";
 const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM || "1536", 10);
 
@@ -35,11 +36,33 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-/** Postgres client — require SSL for Supabase */
-const db = new Client({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+/** Force IPv4 + SSL by resolving Supabase host and connecting via the IPv4 address */
+async function createPgClientFromUrl(pgUrlString) {
+  const u = new URL(pgUrlString); // postgresql://user:pass@host:5432/db
+  const host = u.hostname;
+  const port = parseInt(u.port || "5432", 10);
+  const database = decodeURIComponent(u.pathname.replace(/^\//, ""));
+  const user = decodeURIComponent(u.username);
+  const password = decodeURIComponent(u.password);
+
+  // Resolve IPv4 address for the host
+  const { address: ipv4 } = await new Promise((resolve, reject) =>
+    dns.lookup(host, { family: 4 }, (err, addr, fam) => (err ? reject(err) : resolve({ address: addr, family: fam })))
+  );
+
+  const client = new Client({
+    host: ipv4,           // ← use IPv4 directly to avoid ENETUNREACH
+    port,
+    database,
+    user,
+    password,
+    ssl: { rejectUnauthorized: false },
+  });
+
+  return client;
+}
+
+const db = await createPgClientFromUrl(DATABASE_URL);
 await db.connect();
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -54,9 +77,7 @@ function auth(req, res, next) {
 async function embed(text) {
   const resp = await openai.embeddings.create({ model: EMBEDDINGS_MODEL, input: text });
   const vec = resp.data[0].embedding;
-  if (vec.length !== EMBEDDING_DIM) {
-    throw new Error(`Embedding dim mismatch: got ${vec.length}, expected ${EMBEDDING_DIM}`);
-  }
+  if (vec.length !== EMBEDDING_DIM) throw new Error(`Embedding dim mismatch: got ${vec.length}, expected ${EMBEDDING_DIM}`);
   return vec;
 }
 
@@ -137,7 +158,6 @@ app.get("/recall", auth, async (req, res) => {
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     const lim = Math.max(1, Math.min(50, parseInt(limit, 10) || 10));
 
-    // Build filters
     const conds = ["user_id = $1"]; const params = [user_id];
     if (type) { params.push(type); conds.push(`type = $${params.length}`); }
     if (category) { params.push(category); conds.push(`category = $${params.length}`); }
@@ -146,7 +166,6 @@ app.get("/recall", auth, async (req, res) => {
     if (tags) { tagList = String(tags).split(',').map(s=>s.trim()).filter(Boolean); }
     if (tagList.length) { params.push(tagList); conds.push(`tags && $${params.length}::text[]`); }
 
-    // Vector search
     let vectorResults = [];
     if (query) {
       const qvec = await embed(String(query));
@@ -157,7 +176,6 @@ app.get("/recall", auth, async (req, res) => {
       vectorResults = vres.rows;
     }
 
-    // Keyword prefilter (ILIKE)
     let textResults = [];
     if (query) {
       const tsql = `SELECT user_id, key, value, type, scope, category, tags, source, confidence, pii, sensitivity, version, created_at, updated_at, expires_at, meta
@@ -167,7 +185,6 @@ app.get("/recall", auth, async (req, res) => {
       textResults = tres.rows;
     }
 
-    // No query → just list by filters
     if (!query) {
       const lsql = `SELECT user_id, key, value, type, scope, category, tags, source, confidence, pii, sensitivity, version, created_at, updated_at, expires_at, meta
                     FROM memories WHERE ${conds.join(" AND ")}
@@ -176,7 +193,6 @@ app.get("/recall", auth, async (req, res) => {
       return res.json(lres.rows);
     }
 
-    // Merge & dedupe (vector wins)
     const map = new Map();
     for (const r of [...vectorResults, ...textResults]) {
       const id = `${r.user_id}::${r.key}`;
@@ -188,7 +204,7 @@ app.get("/recall", auth, async (req, res) => {
   }
 });
 
-// ---- List (filters only) ----
+// ---- List ----
 app.get("/list", auth, async (req, res) => {
   try {
     const { user_id, type = "", category = "", tags = "", limit = 100 } = req.query;
@@ -228,7 +244,6 @@ app.delete("/forget", auth, async (req, res) => {
       return res.json({ ok: true, deleted: 1 });
     }
 
-    // delete by filters
     const conds = ["user_id = $1"]; const params = [user_id];
     if (type) { params.push(type); conds.push(`type = $${params.length}`); }
     if (category) { params.push(category); conds.push(`category = $${params.length}`); }
